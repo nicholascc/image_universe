@@ -330,12 +330,14 @@ class CNN(nn.Module):
     # ------------------------------------------------------------------
     #                              TRAIN
     # ------------------------------------------------------------------
-    def loss(self, x, _goal=None):
+    def loss(self, x, goal):
         """
         x shape: (B,4,H,W), channel-3 is mask in [0,1].
         We pick a random t, do forward diffusion on masked pixels, 
         then train the model to predict the added noise.
         """
+        mask = x[:, 3:4, :, :]
+        x[:, :3, :, :][mask == 1] = goal[mask == 1]
         # Unfold
         x_patches = self.to_patches(x)  # (B,4,Hp,Wp,pH,pW)
         B_, C, Hp, Wp, pH, pW = x_patches.shape
@@ -474,7 +476,7 @@ if rank == 0:
 
 max_patch_size = 32
 
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 def make_sample():
     # Apply random shift
     shift_h = random.randint(0, max_patch_size - 1)
