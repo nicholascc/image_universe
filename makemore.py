@@ -336,7 +336,7 @@ class CNN(nn.Module):
         We pick a random t, do forward diffusion on masked pixels, 
         then train the model to predict the added noise.
         """
-        mask = x[:, 3:4, :, :]
+        mask = x[:, 3:4, :, :].repeat(1, 3, 1, 1)
         x[:, :3, :, :][mask == 1] = goal[mask == 1]
         # Unfold
         x_patches = self.to_patches(x)  # (B,4,Hp,Wp,pH,pW)
@@ -478,23 +478,48 @@ max_patch_size = 32
 
 optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 def make_sample():
+    # Generate random mask with 16x16 squares removed with probability 0.3
+    batch_size, _, height, width = normalized_image.shape
+    
+    # Calculate number of 16x16 squares in height and width
+    num_squares_h = height // 16
+    num_squares_w = width // 16
+    
+    # Create a mask where each 16x16 square has a 30% chance of being masked
+    square_mask = torch.rand(batch_size, 1, num_squares_h, num_squares_w, device=device) < 0.3
+    
+    # Upsample the mask to the full image size (each square becomes 16x16)
+    mask = square_mask.repeat_interleave(16, dim=2).repeat_interleave(16, dim=3)
+    
+    # If the image dimensions aren't divisible by 16, adjust the mask size
+    if mask.shape[2] != height or mask.shape[3] != width:
+        mask = mask[:, :, :height, :width]
+    
     # Apply random shift
     shift_h = random.randint(0, max_patch_size - 1)
     shift_w = random.randint(0, max_patch_size - 1)
     
     # Roll the image instead of shifting
     rolled_image = torch.roll(normalized_image, shifts=(-shift_h, -shift_w), dims=(2, 3))
+    # Also roll the mask
+    mask = torch.roll(mask, shifts=(-shift_h, -shift_w), dims=(2, 3))
     
     # Crop the image to a multiple of the patch size
     cropped_image = rolled_image[:, :, 
                     :max_patch_size * (normalized_image.shape[2] // max_patch_size - 1), 
                     :max_patch_size * (normalized_image.shape[3] // max_patch_size - 1)]
+    # Crop the mask to match
+    mask = mask[:, :, 
+           :max_patch_size * (normalized_image.shape[2] // max_patch_size - 1), 
+           :max_patch_size * (normalized_image.shape[3] // max_patch_size - 1)]
     
     # Apply random flipping
     if random.random() > 0.5:
         cropped_image = torch.flip(cropped_image, dims=[2])  # Horizontal flip
+        mask = torch.flip(mask, dims=[2])  # Also flip the mask
     if random.random() > 0.5:
         cropped_image = torch.flip(cropped_image, dims=[3])  # Vertical flip
+        mask = torch.flip(mask, dims=[3])  # Also flip the mask
 
     # Apply random color palette swaps/mutations
     if random.random() > 0:
@@ -512,29 +537,10 @@ def make_sample():
         color_scale = torch.rand(1, 3, 1, 1, device=device) * 0.5 + 0.75  # Scale between 0.75 and 1.25
         cropped_image = cropped_image * color_scale
     
-    # Add a 4th channel for mask (all zeros)
+    # Add a 4th channel for mask
     batch_size, _, height, width = cropped_image.shape
-    mask_channel = torch.zeros(batch_size, 1, height, width, device=device)
-    cropped_image_with_mask = torch.cat([cropped_image, mask_channel], dim=1)
-
-    # Generate random mask with 16x16 squares removed with probability 0.3
-    batch_size, _, height, width = cropped_image.shape
+    cropped_image_with_mask = torch.cat([cropped_image, mask], dim=1)
     
-    # Calculate number of 16x16 squares in height and width
-    num_squares_h = height // 16
-    num_squares_w = width // 16
-    
-    # Create a mask where each 16x16 square has a 30% chance of being masked
-    square_mask = torch.rand(batch_size, 1, num_squares_h, num_squares_w, device=device) < 0.3
-    
-    # Upsample the mask to the full image size (each square becomes 16x16)
-    mask = square_mask.repeat_interleave(16, dim=2).repeat_interleave(16, dim=3)
-    
-    # If the image dimensions aren't divisible by 16, adjust the mask size
-    if mask.shape[2] != height or mask.shape[3] != width:
-        mask = mask[:, :, :height, :width]
-    # Update the mask channel in the image
-    cropped_image_with_mask[:, 3:4, :, :] = mask.float()
     # Remove color information where the mask is applied
     cropped_image_with_mask[:, :3, :, :] = cropped_image_with_mask[:, :3, :, :] * (1 - mask.float())
     
