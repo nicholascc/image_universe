@@ -173,9 +173,10 @@ class CNN(nn.Module):
         initial_filters = 32
 
         self.time_embed = TimeEmbed(embed_dim=128, time_emb_dim=128)
-                # --- Set up beta schedule ---
+        # --- Set up beta schedule ---
         # For example, linearly from 1e-4 to 0.02
-        betas, alphas, alpha_bars = make_beta_schedule(T=100)
+        self.T = 100
+        betas, alphas, alpha_bars = make_beta_schedule(T=self.T)
         # Register them as buffers so they're moved to GPU with .to(device)
         self.register_buffer('betas', betas)
         self.register_buffer('alphas', alphas)
@@ -616,7 +617,7 @@ def generate_one_step(input_image_with_mask):
     assert selected_patch_position is not None, "No suitable patch position found"
     
     with torch.no_grad():
-        output = model.module.generate(selected_patch)
+        output = model.module.ddpm_inpaint(selected_patch)
 
     # Get the position of the selected patch
     y_pos, x_pos = selected_patch_position
@@ -704,7 +705,7 @@ for epoch in range(100000):
             # Convert tensors to images (assuming values in [0,1])
             cropped_image = denormalize_image(batch[:, :3, :, :], norm_stats)
             goal_image = denormalize_image(goal[:, :3, :, :], norm_stats)
-            output = model.module.generate(batch[:1])
+            output = model.module.ddpm_inpaint(batch[:1])
             output_img = denormalize_image(output[:, :3, :, :], norm_stats)
 
             cropped_image = cropped_image[0].cpu().permute(1, 2, 0).clamp(0, 1).numpy()
