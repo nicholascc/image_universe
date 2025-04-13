@@ -166,10 +166,22 @@ class CNN(nn.Module):
         initial_filters = 32
 
         self.time_embed = TimeEmbed(embed_dim=128, time_emb_dim=128)
+                # --- Set up beta schedule ---
+        # For example, linearly from 1e-4 to 0.02
+        betas, alphas, alpha_bars = make_beta_schedule(T=100)
+        # Register them as buffers so they're moved to GPU with .to(device)
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas', alphas)
+        self.register_buffer('alpha_bars', alpha_bars)
+
+        # Time embedding dimension
+        self.time_embed = TimeEmbed(embed_dim=128, time_emb_dim=128)
+
+        # Example: your UNet layers
+        initial_filters = 32
         
-        # Encoder (downsampling path)
         self.enc_conv1 = nn.Sequential(
-            nn.Conv2d(self.in_channels+128, initial_filters, kernel_size=3, padding=1),
+            nn.Conv2d(self.in_channels + 128, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
@@ -200,7 +212,6 @@ class CNN(nn.Module):
         )
         self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
         
-        # Bottleneck
         self.bottleneck = nn.Sequential(
             nn.Conv2d(initial_filters*8, initial_filters*16, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -208,7 +219,6 @@ class CNN(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Decoder (upsampling path)
         self.upconv4 = nn.ConvTranspose2d(initial_filters*16, initial_filters*8, kernel_size=2, stride=2)
         self.dec_conv4 = nn.Sequential(
             nn.Conv2d(initial_filters*16, initial_filters*8, kernel_size=3, padding=1),
@@ -241,22 +251,34 @@ class CNN(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Final output layer
         self.final_conv = nn.Conv2d(initial_filters, self.out_channels, kernel_size=1)
     
     def forward(self, x, t, list_of_patches=False):
-        # Extract patches if input is a full image
+        """
+        x shape: (B, 4, H, W) where channel-3 is the mask.
+        t shape: (B,) of integers in [0..T-1].
+        We embed t and concat it as extra channels. Then do the UNet.
+        """
+        # If the input is a full image, unfold into patches
         if not list_of_patches:
             x = self.to_patches(x)
             B, C, Hp, Wp, pH, pW = x.shape
             x = einops.rearrange(x, 'b c h w p1 p2 -> (b h w) c p1 p2')
             process_as_patches = True
-        
-        t_emb = self.time_embed(t)
-        t_emb = t_emb.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, x.shape[2], x.shape[3])
-        x = torch.cat([x, t_emb], dim=1)
-        
-        # Encoder path
+        else:
+            process_as_patches = False
+
+        # (B*, 4, pH, pW)
+        # Time embedding
+        t_emb = self.time_embed(t)  # shape (B*, 128)
+        # broadcast to 2D
+        t_emb_2d = t_emb.unsqueeze(-1).unsqueeze(-1)  # (B*, 128, 1, 1)
+        t_emb_2d = t_emb_2d.expand(-1, -1, x.shape[-2], x.shape[-1]) # (B*, 128, pH, pW)
+
+        # Concat
+        x = torch.cat([x, t_emb_2d], dim=1)  # => (B*, 4+128, pH, pW)
+
+        # Standard UNet forward
         enc1 = self.enc_conv1(x)
         pool1 = self.pool1(enc1)
         
@@ -269,10 +291,8 @@ class CNN(nn.Module):
         enc4 = self.enc_conv4(pool3)
         pool4 = self.pool4(enc4)
         
-        # Bottleneck
         bottleneck = self.bottleneck(pool4)
         
-        # Decoder path with skip connections
         up4 = self.upconv4(bottleneck)
         merge4 = torch.cat([enc4, up4], dim=1)
         dec4 = self.dec_conv4(merge4)
@@ -289,78 +309,132 @@ class CNN(nn.Module):
         merge1 = torch.cat([enc1, up1], dim=1)
         dec1 = self.dec_conv1(merge1)
         
-        # Final output
-        output = self.final_conv(dec1)
+        out = self.final_conv(dec1)
+        # out shape: (B*, 3, pH, pW)
         
-        # Reconstruct full image from patches if needed
-        if not list_of_patches:
-            output = einops.rearrange(output, '(b h w) c p1 p2 -> b c h w p1 p2', b=B, h=Hp, w=Wp)
-            output = self.from_patches(output)
-        
-        return output
+        # Re-fold if needed
+        if process_as_patches:
+            out = einops.rearrange(out, '(b h w) c p1 p2 -> b c h w p1 p2',
+                                   b=B, h=Hp, w=Wp)
+            out = self.from_patches(out)
+        return out
 
-    def loss(self, x, goal):
-
-        x = self.to_patches(x)
-        B, C, Hp, Wp, pH, pW = x.shape
-        x = einops.rearrange(x, 'b c h w p1 p2 -> (b h w) c p1 p2')
-        # Sample random timesteps for each patch
-        t = torch.randint(0, 100, (x.shape[0],), device=x.device)
-
-        mask = (x[:, 3:4, :, :] == 1).float()
+    # ------------------------------------------------------------------
+    #                              TRAIN
+    # ------------------------------------------------------------------
+    def loss(self, x, _goal=None):
+        """
+        x shape: (B,4,H,W), channel-3 is mask in [0,1].
+        We pick a random t, do forward diffusion on masked pixels, 
+        then train the model to predict the added noise.
+        """
+        # Unfold
+        x_patches = self.to_patches(x)  # (B,4,Hp,Wp,pH,pW)
+        B_, C, Hp, Wp, pH, pW = x_patches.shape
+        # Flatten patches => (B'* = B*Hp*Wp, 4, pH, pW)
+        x_patches = einops.rearrange(x_patches, 'b c h w p1 p2 -> (b h w) c p1 p2')
+        batch_size = x_patches.shape[0]
         
-        # Add noise according to the diffusion schedule
-        noise = torch.randn_like(x)[:,:3,:,:]
-        noise_level = torch.cos(t / 100 * math.pi / 2).reshape(-1, 1, 1, 1).repeat(1, 3, pH, pW)
-        noised_x = noise_level * x[:, :3, :, :] + (1 - noise_level) * noise
-        x[:, :3, :, :] = mask * noised_x + (1 - mask) * x[:, :3, :, :]
-        pred = self.forward(x, t, list_of_patches=True)
-        
-        loss = F.mse_loss(pred, noise)
+        # random t in [0..T-1] for each patch
+        t = torch.randint(0, self.T, (batch_size,), device=x_patches.device)
+
+        # Original image portion:
+        img_0 = x_patches[:, :3]  # (B', 3, pH, pW)
+        mask = x_patches[:, 3:4]  # (B', 1, pH, pW), 1 => "masked" => will be noised
+
+        # forward diffusion at step t:
+        #   x_t = sqrt(alpha_bar[t])*img_0 + sqrt(1 - alpha_bar[t])*noise
+        # But only for masked pixels, unmasked remain = x_0
+        noise = torch.randn_like(img_0)
+
+        alpha_bar_t = self.alpha_bars[t].view(-1,1,1,1)  # shape (B',1,1,1)
+        sqrt_ab = alpha_bar_t.sqrt()
+        sqrt_1mab = (1.0 - alpha_bar_t).sqrt()
+
+        # noised version for masked pixels
+        x_t_masked = sqrt_ab * img_0 + sqrt_1mab * noise
+        # keep unmasked
+        x_t = mask * x_t_masked + (1 - mask) * img_0
+
+        # Combine back with mask => shape (B',4,pH,pW)
+        x_patches_noise = torch.cat([x_t, mask], dim=1)
+
+        # Predict noise
+        noise_pred = self.forward(x_patches_noise, t, list_of_patches=True)
+
+        # MSE loss on the masked region
+        # Option 1: average MSE over all pixels in the patch (common approach)
+        loss = F.mse_loss(noise_pred, noise)
         return loss
-    
-    def generate(self, x):
-        model.eval()
-        x = self.to_patches(x)
-        B, C, Hp, Wp, pH, pW = x.shape
-        x = einops.rearrange(x, 'b c h w p1 p2 -> (b h w) c p1 p2')
-        mask = (x[:, 3:4, :, :] == 1).float()
-        noise = torch.randn_like(x)[:,:3,:,:]
-        x[:, :3, :, :] = mask * noise + (1 - mask) * x[:, :3, :, :]
 
-        mask = (x[:, 3:4, :, :] == 1).bool().repeat(1, 3, 1, 1)
-        
-        # Diffusion sampling loop - gradually denoise from t=999 to t=0
-        for t in range(0, 100, 1):
-            t = torch.tensor(t, device=x.device)
-            # Get timestep embedding
-            t_batch = torch.ones(x.shape[0], dtype=torch.long, device=x.device) * t
-            
-            # Predict noise
-            noise_pred = self.forward(x, t_batch, list_of_patches=True)
-            
-            # Calculate noise level based on cosine schedule
-            noise_level = torch.cos(t / 100 * math.pi / 2)
-            
-            # If not the final step, add some noise for DDPM sampling
-            if t < 99:
-                # Calculate next timestep's noise level
-                next_noise_level = torch.cos((t+1) / 100 * math.pi / 2)
-                noise_to_add = torch.randn_like(x)[:,:3,:,:] * mask
-                # Update x with predicted noise and add new noise
-                updated_x = (next_noise_level / noise_level) * x[:, :3, :, :][mask] - ((1 - next_noise_level**2)**0.5 - (1 - noise_level**2)**0.5) * noise_pred[mask]
-                x[:, :3, :, :][mask] = updated_x + (1 - next_noise_level**2)**0.5 * noise_to_add[mask]
-            else:
-                # Final step - just denoise without adding more noises
-                x[:, :3, :, :][mask] = (x[:, :3, :, :][mask] - (1 - noise_level**2)**0.5 * noise_pred[mask]) / noise_level
-        
-        # Reshape back to full image
-        output = einops.rearrange(x, '(b h w) c p1 p2 -> b c h w p1 p2', b=B, h=Hp, w=Wp)
-        output = self.from_patches(output)
-        model.train()
-        return output
+    # ------------------------------------------------------------------
+    #                              SAMPLE
+    # ------------------------------------------------------------------
+    def ddpm_inpaint(self, x_0):
+        """
+        Inpaint the masked region of x_0 by reverse diffusion.
+        x_0: shape (B,4,H,W) with channel-3 as mask (1=masked).
+        We'll do T steps from t=T-1 down to 0, updating only masked pixels.
+        """
+        self.eval()
+        with torch.no_grad():
+            # 1) Unfold
+            x_patches = self.to_patches(x_0)
+            B_, C, Hp, Wp, pH, pW = x_patches.shape
+            x_patches = einops.rearrange(x_patches, 'b c h w p1 p2 -> (b h w) c p1 p2')
+            # x_patches: shape (B',4,pH,pW)
 
-        
+            img_0 = x_patches[:, :3]  # original content
+            mask = x_patches[:, 3:4]  # 1=masked
+
+            # We'll start from pure noise in the masked region
+            x_t = mask * torch.randn_like(img_0) + (1-mask)*img_0
+
+            # Reverse loop
+            for i in reversed(range(self.T)):
+                t_batch = torch.tensor([i]*x_t.shape[0], device=x_t.device)
+                # Combine x_t with mask
+                combined = torch.cat([x_t, mask], dim=1)  # (B',4,pH,pW)
+
+                # model predicts noise
+                eps_theta = self.forward(combined, t_batch, list_of_patches=True)  # (B',3,pH,pW)
+
+                # Coeffs
+                alpha_i = self.alphas[i]
+                alpha_bar_i = self.alpha_bars[i]
+                # For i>0, alpha_bar_(i-1), etc.
+                if i > 0:
+                    alpha_bar_prev = self.alpha_bars[i-1]
+                else:
+                    alpha_bar_prev = torch.tensor(1.0, device=x_t.device)  # alpha_bar_-1 = 1
+
+                one_over_sqrt_alpha = 1.0 / alpha_i.sqrt()
+                coef_eps = (1.0 - alpha_i)/( (1.0 - alpha_bar_i).sqrt() )
+
+                # x_{t-1} (before adding noise)
+                x_noiseless = one_over_sqrt_alpha * (x_t - coef_eps * eps_theta)
+
+                if i > 0:
+                    # sigma_t
+                    beta_i = self.betas[i]
+                    # eq. var term => ...
+                    # in typical DDPM: 
+                    sigma_i = ((1.0 - alpha_bar_prev)/(1.0 - alpha_bar_i)*beta_i).sqrt()
+                    # sample random z
+                    z = torch.randn_like(x_t)
+                    x_next = x_noiseless + sigma_i * z
+                else:
+                    x_next = x_noiseless
+
+                # only update the masked portion
+                x_t = mask * x_next + (1.0 - mask)*img_0  # keep the unmasked part = x_0
+
+            # Reshape back to full image
+            x_t = einops.rearrange(x_t, '(b h w) c p1 p2 -> b c h w p1 p2',
+                                   b=B_, h=Hp, w=Wp)
+            x_out = self.from_patches(x_t)
+        self.train()
+        return x_out
     
     def to_patches(self, x):
         assert len(x.shape) == 4
@@ -387,11 +461,12 @@ torch.cuda.set_device(rank)
 model = CNN(patch_levels=4).to(device)
 model = DDP(model, device_ids=[rank])
 
-# Initialize comet.ml experiment
-experiment = comet_ml.Experiment(
-    api_key="ZFi08G3WImS7t3E560rj6BTHs",
-    project_name="arcy"
-)
+if rank == 0:
+    # Initialize comet.ml experiment
+    experiment = comet_ml.Experiment(
+        api_key="ZFi08G3WImS7t3E560rj6BTHs",
+        project_name="arcy"
+    )
 
 max_patch_size = 32
 
@@ -538,7 +613,7 @@ def generate_one_step(input_image_with_mask):
     assert selected_patch_position is not None, "No suitable patch position found"
     
     with torch.no_grad():
-        output = model.generate(selected_patch)
+        output = model.module.generate(selected_patch)
 
     # Get the position of the selected patch
     y_pos, x_pos = selected_patch_position
@@ -609,7 +684,7 @@ for epoch in range(100000):
     optimizer.zero_grad()
 
     batch, goal = make_batch(batch_size=32)
-    loss = model.loss(batch, goal)
+    loss = model.module.loss(batch, goal)
     
     # Backward pass
     loss.backward()
@@ -626,7 +701,7 @@ for epoch in range(100000):
             # Convert tensors to images (assuming values in [0,1])
             cropped_image = denormalize_image(batch[:, :3, :, :], norm_stats)
             goal_image = denormalize_image(goal[:, :3, :, :], norm_stats)
-            output = model.generate(batch[:1])
+            output = model.module.generate(batch[:1])
             output_img = denormalize_image(output[:, :3, :, :], norm_stats)
 
             cropped_image = cropped_image[0].cpu().permute(1, 2, 0).clamp(0, 1).numpy()
