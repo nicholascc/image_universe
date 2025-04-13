@@ -186,7 +186,7 @@ class CNN(nn.Module):
         self.time_embed = TimeEmbed(embed_dim=128, time_emb_dim=128)
 
         # Example: your UNet layers
-        initial_filters = 32
+        initial_filters = 512
         
         self.enc_conv1 = nn.Sequential(
             nn.Conv2d(self.in_channels + 128, initial_filters, kernel_size=3, padding=1),
@@ -197,63 +197,63 @@ class CNN(nn.Module):
         self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
         
         self.enc_conv2 = nn.Sequential(
-            nn.Conv2d(initial_filters, initial_filters*2, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(initial_filters*2, initial_filters*2, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
         )
         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
         
         self.enc_conv3 = nn.Sequential(
-            nn.Conv2d(initial_filters*2, initial_filters*4, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(initial_filters*4, initial_filters*4, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
         )
         self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
         
         self.enc_conv4 = nn.Sequential(
-            nn.Conv2d(initial_filters*4, initial_filters*8, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(initial_filters*8, initial_filters*8, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
         )
         self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
         
         self.bottleneck = nn.Sequential(
-            nn.Conv2d(initial_filters*8, initial_filters*16, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(initial_filters*16, initial_filters*16, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
         )
         
-        self.upconv4 = nn.ConvTranspose2d(initial_filters*16, initial_filters*8, kernel_size=2, stride=2)
+        self.upconv4 = nn.ConvTranspose2d(initial_filters, initial_filters, kernel_size=2, stride=2)
         self.dec_conv4 = nn.Sequential(
-            nn.Conv2d(initial_filters*16, initial_filters*8, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(initial_filters*8, initial_filters*8, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
         )
         
-        self.upconv3 = nn.ConvTranspose2d(initial_filters*8, initial_filters*4, kernel_size=2, stride=2)
+        self.upconv3 = nn.ConvTranspose2d(initial_filters, initial_filters, kernel_size=2, stride=2)
         self.dec_conv3 = nn.Sequential(
-            nn.Conv2d(initial_filters*8, initial_filters*4, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(initial_filters*4, initial_filters*4, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
         )
         
-        self.upconv2 = nn.ConvTranspose2d(initial_filters*4, initial_filters*2, kernel_size=2, stride=2)
+        self.upconv2 = nn.ConvTranspose2d(initial_filters, initial_filters, kernel_size=2, stride=2)
         self.dec_conv2 = nn.Sequential(
-            nn.Conv2d(initial_filters*4, initial_filters*2, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(initial_filters*2, initial_filters*2, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
         )
         
-        self.upconv1 = nn.ConvTranspose2d(initial_filters*2, initial_filters, kernel_size=2, stride=2)
+        self.upconv1 = nn.ConvTranspose2d(initial_filters, initial_filters, kernel_size=2, stride=2)
         self.dec_conv1 = nn.Sequential(
-            nn.Conv2d(initial_filters*2, initial_filters, kernel_size=3, padding=1),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
@@ -695,7 +695,7 @@ for epoch in range(100000):
     # Zero gradients
     optimizer.zero_grad()
 
-    batch, goal = make_batch(batch_size=32)
+    batch, goal = make_batch(batch_size=8)
     loss = model.module.loss(batch, goal)
     
     # Backward pass
