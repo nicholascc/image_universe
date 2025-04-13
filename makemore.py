@@ -1,6 +1,7 @@
 
 import argparse
 from math import prod
+import math
 import os
 import random
 import comet_ml
@@ -26,6 +27,17 @@ from PIL import Image
 import torchvision.transforms as transforms
 import time
 import cv2
+
+from emb import TimeEmbed
+
+def make_beta_schedule(T=100, beta_start=1e-4, beta_end=0.02):
+    """
+    Return (betas, alphas, alpha_bars) each of shape (T,).
+    """
+    betas = torch.linspace(beta_start, beta_end, T)
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+    return betas, alphas, alpha_bars
 
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -85,8 +97,15 @@ def crop_to_divisible(image_tensor, divisor=16):
 
 # Load and crop the image
 image_tensor = load_image('image.png')
-#image_tensor = crop_to_divisible(image_tensor, divisor=16)
+# Resize the image to a width of 1024
 print(f"Image tensor shape: {image_tensor.shape}")
+
+_, _, h, w = image_tensor.shape
+new_width = 1024
+new_height = int(h * (new_width / w))
+image_tensor = F.interpolate(image_tensor, size=(new_height, new_width), mode='bilinear', align_corners=False)
+#image_tensor = crop_to_divisible(image_tensor, divisor=16)
+print(f"Image tensor shape, after resizing: {image_tensor.shape}")
 
 def normalize_image(image_tensor, return_stats=True):
     """
@@ -143,76 +162,205 @@ class CNN(nn.Module):
         # Calculate patch size based on patch_levels
         self.patch_size = 2 ** patch_levels
         
-        # Dynamically create encoder layers based on patch_levels
-        encoder_layers = []
-        in_channels = self.in_channels
-        out_channels = 32  # Starting with 32 channels
-        
-        for level in range(patch_levels):
-            # Add convolutional layer with downsampling
-            encoder_layers.append(
-                nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
-            )
-            encoder_layers.append(nn.ReLU(inplace=True))
-            
-            # Update channels for next layer
-            in_channels = out_channels
-            out_channels = out_channels * 2  # Double the channels at each level
-        
-        self.encoder = nn.Sequential(*encoder_layers)
-        
-        # Dynamically create decoder layers based on patch_levels
-        decoder_layers = []
-        in_channels = in_channels  # Start with the last encoder output channels
-        
-        for level in range(patch_levels):
-            # For the last layer, output the original number of channels
-            if level == patch_levels - 1:
-                out_channels = self.out_channels
-            else:
-                out_channels = in_channels // 2  # Halve the channels at each level
-            
-            # Add transposed convolutional layer with upsampling
-            decoder_layers.append(
-                nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1)
-            )
-            
-            # Add ReLU except for the last layer
-            if level < patch_levels - 1:
-                decoder_layers.append(nn.ReLU(inplace=True))
-            
-            # Update channels for next layer
-            in_channels = out_channels
-        
-        self.decoder = nn.Sequential(*decoder_layers)
+        # Initial number of filters
+        initial_filters = 32
 
+        self.time_embed = TimeEmbed(embed_dim=128, time_emb_dim=128)
+        
+        # Encoder (downsampling path)
+        self.enc_conv1 = nn.Sequential(
+            nn.Conv2d(self.in_channels+128, initial_filters, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        self.enc_conv2 = nn.Sequential(
+            nn.Conv2d(initial_filters, initial_filters*2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(initial_filters*2, initial_filters*2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        self.enc_conv3 = nn.Sequential(
+            nn.Conv2d(initial_filters*2, initial_filters*4, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(initial_filters*4, initial_filters*4, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        self.enc_conv4 = nn.Sequential(
+            nn.Conv2d(initial_filters*4, initial_filters*8, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(initial_filters*8, initial_filters*8, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(initial_filters*8, initial_filters*16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(initial_filters*16, initial_filters*16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Decoder (upsampling path)
+        self.upconv4 = nn.ConvTranspose2d(initial_filters*16, initial_filters*8, kernel_size=2, stride=2)
+        self.dec_conv4 = nn.Sequential(
+            nn.Conv2d(initial_filters*16, initial_filters*8, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(initial_filters*8, initial_filters*8, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.upconv3 = nn.ConvTranspose2d(initial_filters*8, initial_filters*4, kernel_size=2, stride=2)
+        self.dec_conv3 = nn.Sequential(
+            nn.Conv2d(initial_filters*8, initial_filters*4, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(initial_filters*4, initial_filters*4, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.upconv2 = nn.ConvTranspose2d(initial_filters*4, initial_filters*2, kernel_size=2, stride=2)
+        self.dec_conv2 = nn.Sequential(
+            nn.Conv2d(initial_filters*4, initial_filters*2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(initial_filters*2, initial_filters*2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.upconv1 = nn.ConvTranspose2d(initial_filters*2, initial_filters, kernel_size=2, stride=2)
+        self.dec_conv1 = nn.Sequential(
+            nn.Conv2d(initial_filters*2, initial_filters, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(initial_filters, initial_filters, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Final output layer
+        self.final_conv = nn.Conv2d(initial_filters, self.out_channels, kernel_size=1)
     
-    def forward(self, x):
-        encoded = self.encoder(x)
-        decoded = self.decoder(encoded)
-        return decoded
-    
-    def encode(self, x, list_of_patches=False):
+    def forward(self, x, t, list_of_patches=False):
+        # Extract patches if input is a full image
         if not list_of_patches:
             x = self.to_patches(x)
             B, C, Hp, Wp, pH, pW = x.shape
             x = einops.rearrange(x, 'b c h w p1 p2 -> (b h w) c p1 p2')
-        x = self.encoder(x)
-        if not list_of_patches:
-            x = einops.rearrange(x, '(b h w) c p1 p2 -> b c h w p1 p2', b=B, h=Hp, w=Wp)
-            assert x.shape[-1] == 1 and x.shape[-2] == 1
-            x = x.squeeze(-1).squeeze(-1)
-        else:
-            x = x.squeeze(-1).squeeze(-1)
-        return x
+            process_as_patches = True
         
-    def decode(self, z):
-        B, C, H, W = z.shape
-        z = einops.rearrange(z, 'b c h w -> (b h w) c 1 1')
-        z = self.decoder(z)
-        z = einops.rearrange(z, '(b h w) c p1 p2 -> b c h w p1 p2', b=B, h=H, w=W)
-        z = self.from_patches(z)
-        return z
+        t_emb = self.time_embed(t)
+        t_emb = t_emb.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, x.shape[2], x.shape[3])
+        x = torch.cat([x, t_emb], dim=1)
+        
+        # Encoder path
+        enc1 = self.enc_conv1(x)
+        pool1 = self.pool1(enc1)
+        
+        enc2 = self.enc_conv2(pool1)
+        pool2 = self.pool2(enc2)
+        
+        enc3 = self.enc_conv3(pool2)
+        pool3 = self.pool3(enc3)
+        
+        enc4 = self.enc_conv4(pool3)
+        pool4 = self.pool4(enc4)
+        
+        # Bottleneck
+        bottleneck = self.bottleneck(pool4)
+        
+        # Decoder path with skip connections
+        up4 = self.upconv4(bottleneck)
+        merge4 = torch.cat([enc4, up4], dim=1)
+        dec4 = self.dec_conv4(merge4)
+        
+        up3 = self.upconv3(dec4)
+        merge3 = torch.cat([enc3, up3], dim=1)
+        dec3 = self.dec_conv3(merge3)
+        
+        up2 = self.upconv2(dec3)
+        merge2 = torch.cat([enc2, up2], dim=1)
+        dec2 = self.dec_conv2(merge2)
+        
+        up1 = self.upconv1(dec2)
+        merge1 = torch.cat([enc1, up1], dim=1)
+        dec1 = self.dec_conv1(merge1)
+        
+        # Final output
+        output = self.final_conv(dec1)
+        
+        # Reconstruct full image from patches if needed
+        if not list_of_patches:
+            output = einops.rearrange(output, '(b h w) c p1 p2 -> b c h w p1 p2', b=B, h=Hp, w=Wp)
+            output = self.from_patches(output)
+        
+        return output
+
+    def loss(self, x, goal):
+
+        x = self.to_patches(x)
+        B, C, Hp, Wp, pH, pW = x.shape
+        x = einops.rearrange(x, 'b c h w p1 p2 -> (b h w) c p1 p2')
+        # Sample random timesteps for each patch
+        t = torch.randint(0, 100, (x.shape[0],), device=x.device)
+
+        mask = (x[:, 3:4, :, :] == 1).float()
+        
+        # Add noise according to the diffusion schedule
+        noise = torch.randn_like(x)[:,:3,:,:]
+        noise_level = torch.cos(t / 100 * math.pi / 2).reshape(-1, 1, 1, 1).repeat(1, 3, pH, pW)
+        noised_x = noise_level * x[:, :3, :, :] + (1 - noise_level) * noise
+        x[:, :3, :, :] = mask * noised_x + (1 - mask) * x[:, :3, :, :]
+        pred = self.forward(x, t, list_of_patches=True)
+        
+        loss = F.mse_loss(pred, noise)
+        return loss
+    
+    def generate(self, x):
+        model.eval()
+        x = self.to_patches(x)
+        B, C, Hp, Wp, pH, pW = x.shape
+        x = einops.rearrange(x, 'b c h w p1 p2 -> (b h w) c p1 p2')
+        mask = (x[:, 3:4, :, :] == 1).float()
+        noise = torch.randn_like(x)[:,:3,:,:]
+        x[:, :3, :, :] = mask * noise + (1 - mask) * x[:, :3, :, :]
+
+        mask = (x[:, 3:4, :, :] == 1).bool().repeat(1, 3, 1, 1)
+        
+        # Diffusion sampling loop - gradually denoise from t=999 to t=0
+        for t in range(0, 100, 1):
+            t = torch.tensor(t, device=x.device)
+            # Get timestep embedding
+            t_batch = torch.ones(x.shape[0], dtype=torch.long, device=x.device) * t
+            
+            # Predict noise
+            noise_pred = self.forward(x, t_batch, list_of_patches=True)
+            
+            # Calculate noise level based on cosine schedule
+            noise_level = torch.cos(t / 100 * math.pi / 2)
+            
+            # If not the final step, add some noise for DDPM sampling
+            if t < 99:
+                # Calculate next timestep's noise level
+                next_noise_level = torch.cos((t+1) / 100 * math.pi / 2)
+                noise_to_add = torch.randn_like(x)[:,:3,:,:] * mask
+                # Update x with predicted noise and add new noise
+                updated_x = (next_noise_level / noise_level) * x[:, :3, :, :][mask] - ((1 - next_noise_level**2)**0.5 - (1 - noise_level**2)**0.5) * noise_pred[mask]
+                x[:, :3, :, :][mask] = updated_x + (1 - next_noise_level**2)**0.5 * noise_to_add[mask]
+            else:
+                # Final step - just denoise without adding more noises
+                x[:, :3, :, :][mask] = (x[:, :3, :, :][mask] - (1 - noise_level**2)**0.5 * noise_pred[mask]) / noise_level
+        
+        # Reshape back to full image
+        output = einops.rearrange(x, '(b h w) c p1 p2 -> b c h w p1 p2', b=B, h=Hp, w=Wp)
+        output = self.from_patches(output)
+        model.train()
+        return output
+
+        
     
     def to_patches(self, x):
         assert len(x.shape) == 4
@@ -229,7 +377,15 @@ class CNN(nn.Module):
 import comet_ml
 from tqdm import tqdm
 
+
+# Initialize distributed context
+dist.init_process_group(backend='nccl')
+rank = int(os.environ.get("LOCAL_RANK", 0))
+torch.cuda.set_device(rank)
+
+# Create model and move to device
 model = CNN(patch_levels=4).to(device)
+model = DDP(model, device_ids=[rank])
 
 # Initialize comet.ml experiment
 experiment = comet_ml.Experiment(
@@ -239,7 +395,6 @@ experiment = comet_ml.Experiment(
 
 max_patch_size = 32
 
-# Set up optimizer
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 def make_sample():
     # Apply random shift
@@ -383,7 +538,7 @@ def generate_one_step(input_image_with_mask):
     assert selected_patch_position is not None, "No suitable patch position found"
     
     with torch.no_grad():
-        output = model(selected_patch)
+        output = model.generate(selected_patch)
 
     # Get the position of the selected patch
     y_pos, x_pos = selected_patch_position
@@ -420,7 +575,7 @@ def generate(goal):
     initial_frame = initial_frame[0].cpu().permute(1, 2, 0).clamp(0, 1).numpy()
     frames.append((initial_frame * 255).astype(np.uint8))
     
-    for _ in range(100):
+    for _ in tqdm(range(100)):
         input_image_with_mask = generate_one_step(input_image_with_mask)
         
         # Add the current state to the video frames
@@ -449,34 +604,29 @@ def generate(goal):
 model.train()
 
 # Training loop
-progress_bar = tqdm(range(100000), desc="Training")
-for epoch in progress_bar:
+for epoch in range(100000):
     # Zero gradients
     optimizer.zero_grad()
 
-    batch, goal = make_batch(batch_size=64)
-    output = model(batch)
-    
-    # Calculate loss
-    loss = F.mse_loss(output, goal)
+    batch, goal = make_batch(batch_size=32)
+    loss = model.loss(batch, goal)
     
     # Backward pass
     loss.backward()
     
     # Update weights
     optimizer.step()
-    
-    # Log progress
-    progress_bar.set_postfix(loss=f"{loss.item():.6f}")
-    
+        
     # Log to comet.ml
-    if epoch % 10 == 0 or epoch == 999:
+    if epoch % 10 == 0 and rank == 0:
+        print(f"Epoch {epoch} loss: {loss.item()}")
         experiment.log_metric("loss", loss.item(), step=epoch)
         
         with torch.no_grad():
             # Convert tensors to images (assuming values in [0,1])
             cropped_image = denormalize_image(batch[:, :3, :, :], norm_stats)
             goal_image = denormalize_image(goal[:, :3, :, :], norm_stats)
+            output = model.generate(batch[:1])
             output_img = denormalize_image(output[:, :3, :, :], norm_stats)
 
             cropped_image = cropped_image[0].cpu().permute(1, 2, 0).clamp(0, 1).numpy()
@@ -486,7 +636,7 @@ for epoch in progress_bar:
             experiment.log_image(cropped_image, name=f"input_epoch_{epoch}")
             experiment.log_image(goal_image, name=f"goal_epoch_{epoch}")
             experiment.log_image(output_img, name=f"reconstruction_epoch_{epoch}")
-    if epoch % 500 == 0:
+    if epoch % 500 == 0 and rank == 0:
         final_image, video_path = generate(goal)
         # Log the final generated image
         final_output = denormalize_image(final_image[:, :3, :, :], norm_stats)
