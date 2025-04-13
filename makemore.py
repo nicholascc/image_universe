@@ -30,6 +30,13 @@ import cv2
 
 from emb import TimeEmbed
 
+
+# Initialize distributed context
+dist.init_process_group(backend='nccl')
+rank = int(os.environ.get("LOCAL_RANK", 0))
+torch.cuda.set_device(rank)
+
+
 def make_beta_schedule(T=100, beta_start=1e-4, beta_end=0.02):
     """
     Return (betas, alphas, alpha_bars) each of shape (T,).
@@ -452,11 +459,6 @@ import comet_ml
 from tqdm import tqdm
 
 
-# Initialize distributed context
-dist.init_process_group(backend='nccl')
-rank = int(os.environ.get("LOCAL_RANK", 0))
-torch.cuda.set_device(rank)
-
 # Create model and move to device
 model = CNN(patch_levels=4).to(device)
 model = DDP(model, device_ids=[rank])
@@ -467,6 +469,7 @@ if rank == 0:
         api_key="ZFi08G3WImS7t3E560rj6BTHs",
         project_name="arcy"
     )
+
 
 max_patch_size = 32
 
